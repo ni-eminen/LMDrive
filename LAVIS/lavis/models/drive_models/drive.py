@@ -17,6 +17,11 @@ from lavis.common.registry import registry
 from lavis.models.blip2_models.blip2 import Blip2Base, disabled_train
 from timm import create_model
 
+from LAVIS.lavis.models.drive_models.encoder import (
+    ObjectLevelBEVEncoder,
+    ObjectLevelSlotsEncoder,
+)
+
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
@@ -44,6 +49,7 @@ class Blip2VicunaDrive(Blip2Base):
 
     def __init__(
         self,
+        config=None, # THESIS: added config for carformer config
         preception_model="",
         preception_model_ckpt='',
         load_pretrained=True,
@@ -81,6 +87,20 @@ class Blip2VicunaDrive(Blip2Base):
 
 
         self.visual_encoder = create_model(preception_model) #TODO with timm
+        
+        ## THESIS: bev slot encoder from carformer (SAVi)
+        if config.training["object_level"]:
+            if config.training.get("use_slots", False):
+                self.use_slots = True
+                self.bev_encoder = ObjectLevelSlotsEncoder(
+                    config.training["encoder_backbone"]
+                )
+            else:
+                self.bev_encoder = ObjectLevelBEVEncoder(
+                    config.training["encoder_backbone"]
+                )
+        ## THESIS
+            
         self.ln_vision = LayerNorm(self.visual_encoder.num_features)
         if load_pretrained:
             pretrain_weights = torch.load(preception_model_ckpt, map_location=torch.device('cpu'))['state_dict']
@@ -372,35 +392,59 @@ class Blip2VicunaDrive(Blip2Base):
         return res
 
     def forward(self, samples, inference_mode=False, image_embeds=None):
-        if image_embeds is None: # train mode
-            device = samples["rgb_front"].device
-            bs = samples['rgb_front'].size(0)
-            t = samples['rgb_front'].size(1)
-            for key in ['rgb_front', 'rgb_left', 'rgb_right', 'rgb_rear', 'rgb_center', 'lidar', 'num_points', 'velocity']:
-                shapz = samples[key].size()
-                samples[key] = samples[key].view(bs*t, *shapz[2:])
+        # if image_embeds is None: # train mode
+        #     device = samples["rgb_front"].device
+        #     bs = samples['velocity'].size(0)
+        #     t = samples['velocity'].size(1)
+        #     for key in ['num_points', 'velocity']:
+        #         shapz = samples[key].size()
+        #         samples[key] = samples[key].view(bs*t, *shapz[2:])
 
-            if self.freeze_decoder_of_visual_encoder:
-                with torch.no_grad():
-                    with self.maybe_autocast():
-                        image_embeds_full = []
-                        splited_samples = self.split_data(samples)
-                        for i in range(self.split_section_num_for_visual_encoder):
-                            image_embeds = self.visual_encoder(splited_samples[i])
-                            image_embeds_full.append(image_embeds)
-                        image_embeds = torch.cat(image_embeds_full, dim=0)
-            else:
-                with self.maybe_autocast():
-                    image_embeds = self.visual_encoder(samples)
-        else: # inference mode
-            device = image_embeds.device
-            bs = image_embeds.size(0)
-            t = image_embeds.size(1)
-            image_embeds = image_embeds.view(bs*t, *image_embeds.size()[2:])
+        #     if self.freeze_decoder_of_visual_encoder:
+        #         with torch.no_grad():
+        #             with self.maybe_autocast():
+        #                 image_embeds_full = []
+        #                 splited_samples = self.split_data(samples)
+        #                 for i in range(self.split_section_num_for_visual_encoder):
+        #                     image_embeds = self.visual_encoder(splited_samples[i])
+        #                     image_embeds_full.append(image_embeds)
+        #                 image_embeds = torch.cat(image_embeds_full, dim=0)
+        #     else:
+        #         with self.maybe_autocast():
+        #             image_embeds = self.visual_encoder(samples)
+        # else: # inference mode
+        #     device = image_embeds.device
+        #     bs = image_embeds.size(0)
+        #     t = image_embeds.size(1)
+        #     image_embeds = image_embeds.view(bs*t, *image_embeds.size()[2:])
 
-        image_embeds = self.ln_vision(image_embeds)
+        # image_embeds = self.ln_vision(image_embeds)
+        
+        ########################################################################
+        # CARFORMER CODE HERE
+        # OUTPUTS SLOT ENCODINGS
+        device = samples["velocity"].device
+        bs = samples['velocity'].size(0)
+        t = samples['velocity'].size(1)
+        bev_latent, bev_object_level_ids, bev_targets = self.bev_encoder(
+            samples["bevslots"],
+            samples["bevobject"],
+            samples["bevobjecttype"],
+            samples.get(
+                "bevslotslatent", None
+            ),  # If we have precomputed slots latents, use them
+            return_targets=True,
+        )
+
+        samples["bevobjectlatent"] = bev_latent
+        samples["bevobjecttype"] = bev_object_level_ids
+        if self.cfg.training["use_future_vehicle_forcast"]:
+            samples["targetbevslotslatent"] = bev_targets
+        samples["bev_latent"] = samples["bevobjecttype"]
+        ########################################################################
+
         if self.has_qformer:
-            query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
+            query_tokens = self.query_tokens.expand(bev_latent.shape[0], -1, -1) # figure out the correct query token shape
             text_Qformer = self.llm_tokenizer(
                 [i for i in samples['text_input'] for _ in range(t)],
                 padding='longest',
@@ -466,7 +510,7 @@ class Blip2VicunaDrive(Blip2Base):
             )
 
         # predicted_waypoints: bs, seq_len, 10
-        if self.has_gru_decoder:
+        if self.has_gru_decoder: # CONTINUE
             output_wp = []
             _, n_tokens, _ =hidden_states.size()
             x = torch.zeros(size=(bs*n_tokens, 2), dtype=hidden_states.dtype).to(device)
