@@ -424,8 +424,8 @@ class Blip2VicunaDrive(Blip2Base):
         # CARFORMER CODE HERE
         # OUTPUTS SLOT ENCODINGS
         device = samples["velocity"].device
-        bs = samples['velocity'].size(0)
-        t = samples['velocity'].size(1)
+        bs = samples['velocity'].size(0) # batch size
+        t = samples['velocity'].size(1) # number of timesteps
         bev_latent, bev_object_level_ids, bev_targets = self.bev_encoder(
             samples["bevslots"],
             samples["bevobject"],
@@ -454,13 +454,13 @@ class Blip2VicunaDrive(Blip2Base):
             ).to(device)
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(device)
             Qformer_atts = torch.cat([query_atts, text_Qformer.attention_mask],dim=1)
-            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(device)
+            image_atts = torch.ones(bev_latent.size()[:-1], dtype=torch.long).to(device)
 
             query_output = self.Qformer.bert(
                 text_Qformer.input_ids,
                 attention_mask=Qformer_atts,
                 query_embeds=query_tokens,
-                encoder_hidden_states=image_embeds,
+                encoder_hidden_states=bev_latent, # not certain if this should be bev_latent
                 encoder_attention_mask=image_atts,
                 return_dict=True,
             )
